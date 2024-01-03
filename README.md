@@ -1,7 +1,7 @@
 <img src="https://github.com/dirkpetersen/scibob/assets/1427719/9edbe9b4-7e79-4aa5-8ef2-4edb9d66f343" alt="Bob the Builder in Science Mode" align=left height="35%" width="35%"/>
 
 # SciBob
-SciBob is a longer term project to create a meta-builder and management tool for scientific software, it will drive other tools such as EasyBuild, Spack and Conda/Mamba to build a single environment using lmod modules and integrates documentation from various sites.
+SciBob is a longer term project to create a meta-builder and management tool for scientific software, it will drive other tools such as EasyBuild/EESSI, Spack and Conda/Mamba to build a single environment using lmod modules and integrates documentation from various sites.
 
 The first element of SciBob is `aws-eb`, a tool to build recent EasyBuild software (EasyConfigs) in AWS. 
 
