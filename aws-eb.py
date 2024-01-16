@@ -5,26 +5,30 @@ AWS-EB builds scientific software packages using Easybuild
 on AWS EC2 instances and syncs the binaries with S3 buckets
 """
 # internal modules
-import sys, os, argparse, json, configparser, platform, collections
-import datetime, tarfile, zipfile, textwrap, socket, json
-import math, signal, shlex, time, re, inspect, traceback, subprocess
-import shutil, tempfile, glob, concurrent.futures, operator
+import sys, os, argparse, json, configparser, platform, subprocess
+import datetime, tarfile, zipfile, textwrap, socket, json, inspect
+import math, signal, shlex, time, re, traceback, operator, glob 
+import shutil, tempfile, concurrent.futures
 if sys.platform.startswith('linux'):
     import getpass, pwd, grp
 # stuff from pypi
 try:
     import boto3, botocore, urllib3
-    import requests
+    import requests    
     from packaging.version import parse, InvalidVersion    
+    # I pulled these from github, likely not the proper way to do it
     from easybuild.framework.easyconfig.parser import EasyConfigParser
     from easybuild.tools.build_log import EasyBuildError
+    # from EB tutorial, likely the proper way to do it 
+    from easybuild.framework.easyconfig.tools import det_easyconfig_paths, parse_easyconfigs
+    from easybuild.tools.options import set_up_configuration
     import psutil
 except:
     pass
     #print('Error: EasyBuild not found. Please install it first.')
 
 __app__ = 'AWS-EB, a user friendly build tool for AWS EC2'
-__version__ = '0.30.0'
+__version__ = '0.40'
 
 def main():
         
@@ -43,10 +47,10 @@ def main():
     # Instantiate classes required by all functions         
     cfg = ConfigManager(args)
     aws = None
-    if not args.subcmd in ['download', 'dld']:
-        aws = AWSBoto(args, cfg)
+    #if not args.subcmd in ['download', 'dld']:
+    aws = AWSBoto(args, cfg)
     bld = Builder(args, cfg, aws)
-    
+        
     if args.version:
         args_version(cfg)
 
@@ -123,7 +127,7 @@ def subcmd_config(args, cfg, aws):
         cfg.binfolder = '~/.local/bin'
         cfg.binfolderx = os.path.expanduser(cfg.binfolder)
         if not os.path.exists(cfg.binfolderx):
-            os.makedirs(cfg.binfolderx, mode=0o775)        
+            os.makedirs(cfg.binfolderx, mode=0o775, exist_ok=True)        
     else:        
         if cfg.binfolder.startswith(cfg.home_dir):
             cfg.binfolder = cfg.binfolder.replace(cfg.home_dir, '~')
@@ -155,7 +159,7 @@ def subcmd_config(args, cfg, aws):
 
     if args.monitor:
         # monitoring only setup, do not continue 
-        me = os.path.join(cfg.binfolderx,'aws-eb')
+        me = os.path.join(cfg.binfolderx, cfg.scriptname)
         cfg.write('general', 'email', args.monitor)
         cfg.add_systemd_cron_job(f'{me} launch --monitor','30')
         return True
@@ -220,6 +224,10 @@ def subcmd_launch(args,cfg,bld,aws):
     cfg.printdbg ("build:", args.awsprofile)
     cfg.printdbg(f'default cmdline: aws-eb build')
 
+    if args.untar:
+        bld._untar_eb_software(args.untar)
+        return True
+
     if args.monitor:
         # aws inactivity and cost monitoring
         aws.monitor_ec2()
@@ -250,23 +258,14 @@ def subcmd_launch(args,cfg,bld,aws):
         print('Please specify a CPU or a GPU type. Run config --list to see types.')
         return False
 
-    os_id, version_id = cfg.get_os_release_info()
-
-    if not os_id or not version_id:
-        print('Could not determine OS release information.')
-        return False    
-    
-    s3_prefix = f'{os_id}-{version_id}_{args.cputype}'
-    if args.gputype:
-        s3_prefix += f'_{args.gputype}'
-
-    #instance_type = aws.get_ec2_smallest_instance_type(fam, args.vcpus, args.mem*1024)
     instance_type, _, _= aws._ec2_get_cheapest_spot_instance(args.cputype, args.vcpus, args.mem)
         
     print(f'{instance_type} is the cheapest spot instance with at least {args.vcpus} vcpus / {args.mem} GB mem')
 
     if not args.build:
-        aws.ec2_deploy(768, instance_type) # 768GB disk for the build instance
+        #if args.os == "amazon": # We will just use JuiceFS
+        #    print('Amazon Linux will use JuiceFS')
+        aws.ec2_deploy(args.disk, instance_type)
         return True
 
     # *******************************************
@@ -276,12 +275,27 @@ def subcmd_launch(args,cfg,bld,aws):
         # create an initial copy of the binaries 
         print(f'Creating initial copy from {args.firstbucket} to {cfg.bucket} ...', flush=True)
         aws.s3_duplicate_bucket(args.firstbucket, cfg.bucket)
+    os_id, version_id = cfg.get_os_release_info()
+    if not os_id or not version_id:
+        print('Could not determine OS release information.')
+        return False        
+    s3_prefix = f'{os_id}-{version_id}_{args.cputype}'
+    if args.gputype:
+        s3_prefix += f'_{args.gputype}'        
     print('s3_prefix:', s3_prefix)
     ecfgroot = os.path.join(cfg.home_dir, 'easybuild-easyconfigs', 'easybuild', 'easyconfigs')
     if args.ebrelease:
         ecfgroot = os.path.join(cfg.home_dir, '.local', 'easybuild', 'easyconfigs')
-    bld.build_all_eb(ecfgroot, s3_prefix, include=args.include, exclude=args.exclude)
 
+    cfg.install_os_packages(['golang', 'pigz', 'iftop', 'iotop', 'htop', 'fuse3'])
+    rclone = Rclone(args, cfg)
+    print(f'Mounting rclone ":s3:{cfg.archivepath}/sources" at "{bld.eb_root}/sources_s3" ...')
+    rpid = rclone.mount(f':s3:{cfg.archivepath}/sources', f'{bld.eb_root}/sources_s3')
+    print(f'rclone mount pid: {rpid}')
+    bld.build_all_eb(ecfgroot, s3_prefix, include=args.include, exclude=args.exclude)
+    if not args.keeprunning:
+        rclone.unmount(f'{bld.eb_root}/sources_s3')
+    
 def subcmd_download(args,cfg,bld,aws):
 
     cfg.printdbg(f'default cmdline: aws-eb download')
@@ -337,11 +351,20 @@ def subcmd_download(args,cfg,bld,aws):
     # Running download
     print(f"\nDownloading packages from s3://{cfg.archivepath}/{s3_prefix} to {bld.eb_root} ... ", flush=True)
 
-    bld.rclone_download_compare = '--size-only'
-    bld.download(f':s3:{cfg.archivepath}', bld.eb_root, s3_prefix, with_source=args.withsource)
+    # mounting sources localtion 
+    rclone = Rclone(args, cfg)
+    print(f'Mounting rclone ":s3:{cfg.archivepath}/sources" at "{bld.eb_root}/sources_s3" ...')
+    rpid = rclone.mount(f':s3:{cfg.archivepath}/sources', f'{bld.eb_root}/sources_s3')
+    print(f'rclone mount pid: {rpid}')    
 
-    print(f" Untarring packages ... ", flush=True)
-    all_tars, new_tars = bld._untar_eb_software(os.path.join(bld.eb_root, 'software'))
+    # download the Modules ()
+    bld.rclone_download_compare = '--size-only'
+    bld.download(f':s3:{cfg.archivepath}', bld.eb_root, s3_prefix)
+
+    print(f" Untarring packages ... ", flush=True)    
+    #all_tars, new_tars = bld._untar_eb_software(os.path.join(bld.eb_root, 'software'))
+    pref = f'{cfg.archiveroot}/{s3_prefix}/software'
+    aws.s3_download_untar(cfg.bucket, pref, os.path.join(bld.eb_root, 'software'),args.vcpus*50)
 
     print('All software was downloaded to:', bld.eb_root)
 
@@ -354,7 +377,6 @@ def subcmd_download(args,cfg,bld,aws):
 
 def subcmd_buildstatus(args,cfg,aws):
 
-    #counts = collections.defaultdict(lambda: collections.defaultdict(int))
     jf = f'{cfg.archiveroot}/{args.prefix}/eb-build-status.json'
     print(f'\nSummarizing s3://{cfg.bucket}/{jf} ...\n')
     statdict = aws.s3_get_json(jf)
@@ -390,32 +412,54 @@ def subcmd_buildstatus(args,cfg,aws):
 
 def subcmd_ssh(args, cfg, aws):
 
-    if args.list:
-        print ('Listing machines ... ', flush=True, end='')
+    if args.terminate:
+        aws.ec2_terminate_instance(args.terminate)
+        return True
+
     ilist = aws.ec2_list_instances('Name', 'AWSEBSelfDestruct')
     ips = [sublist[0] for sublist in ilist if sublist]
+ 
     if args.list:
+        print ('Listing machines ... ', flush=True, end='')
         if ips:                                
             aws.print_aligned_lists(ilist,"Running EC2 Instances:")      
         else:
             print('No running instances detected')
-        return True        
-    if args.terminate:
-        aws.ec2_terminate_instance(args.terminate)
-        return True        
+        return True 
+           
+    myhost = myhost = cfg.read('cloud', 'ec2_last_instance')
+    remote_path = ''; scpmode = ''
     if args.sshargs:
-        if ':' in args.sshargs[0]:
-            myhost, remote_path = args.sshargs[0].split(':')
-        else:
+        testpath = os.path.expanduser(args.sshargs[0]).replace('*', '')
+        if os.path.exists(testpath) and len(args.sshargs) == 2:
+            myhost = args.sshargs[1]
+            if ':' in args.sshargs[1]:
+                myhost, remote_path = args.sshargs[1].split(':')
+                if args.subcmd == 'scp':
+                    scpmode = 'upload'
+        elif len(args.sshargs) <= 2:
             myhost = args.sshargs[0]
-            remote_path = ''
-    else:
-        myhost = cfg.read('cloud', 'ec2_last_instance')   
+            if ':' in args.sshargs[0]:
+                myhost, remote_path = args.sshargs[0].split(':')
+                if args.subcmd == 'scp':
+                    scpmode = 'download'
+        else:
+            print('The "ssh/scp" sub command supports currently 2 arguments')
+            return False
+        
+    elif not myhost:
+        print('Please specify a host name or IP address')
+        return False
+
     if ips and not myhost in ips:
-        print(f'{myhost} is no longer running, replacing with {ips[-1]}')
-        myhost = ips[-1]
-        cfg.write('cloud', 'ec2_last_instance', myhost)
+        if '/' in myhost:
+            print(f'{myhost} not found')
+        else:    
+            print(f'{myhost} is not running, you could replace it with {ips[-1]}')
+        return False            
+    
     sshuser = aws.ec2_get_default_user(myhost, ilist)
+
     # adding anoter public key to host
     if args.addkey:
         if not os.path.exists(args.addkey):
@@ -425,28 +469,23 @@ def subcmd_ssh(args, cfg, aws):
                 return False
         ret = aws.ssh_add_key_to_remote_host(args.addkey, sshuser, myhost)
         return ret
+
+    if scpmode:
+        if scpmode == 'upload':                
+            ret=aws.ssh_upload(sshuser, myhost, args.sshargs[0], remote_path, False, False)
+            #print(ret)  #stdout,ret.stderr
+        elif scpmode == 'download':    
+            ret=aws.ssh_download(sshuser, myhost, remote_path, args.sshargs[1], False)
+            #print(ret)  #stdout,ret.stderr
+        return True
+    
     if args.subcmd == 'ssh':
         print(f'Connecting to {myhost} ...')
         aws.ssh_execute(sshuser, myhost)
         return True
-    elif args.subcmd == 'scp':
-        if len(args.sshargs) != 2:
-            print('The "scp" sub command supports currently 2 arguments')
-            return False
-        hostloc = next((i for i, item in enumerate(args.sshargs) if ":" in item), None)
-        if hostloc == 0:
-            # the hostname is in the first argument: download
-            host, remote_path = args.sshargs[0].split(':')
-            ret=aws.ssh_download(sshuser, host, remote_path, args.sshargs[1])
-        elif hostloc == 1:
-            # the hostname is in the second argument: uploaad
-            host, remote_path = args.sshargs[1].split(':')
-            ret=aws.ssh_upload(sshuser, host, args.sshargs[0], remote_path)
-        else:
-            print('The "scp" sub command supports currently 2 arguments')
-            return False
-        print(ret.stdout,ret.stderr)
-
+    
+    print('This option is not supported.')
+    
 class Builder:
     def __init__(self, args, cfg, aws):
         self.args = args
@@ -472,7 +511,13 @@ class Builder:
         excludes = exclude.split(',') if exclude else []
 
         # install a lot of required junk 
-        self._install_os_dependencies(easyconfigroot)
+        #if not self.args.debug:
+            #self._install_os_dependencies(easyconfigroot, minimal=True)        
+        untar = os.path.join(self.cfg.binfolderx,'untar')
+        if os.path.exists(f'{untar}.go'):
+            subprocess.run(['go', 'build', '-o', untar, f'{untar}.go'], shell=True)
+        # set up easybuild config 
+        opts, _ = set_up_configuration(args=[], silent=True)
         softwaredir = os.path.join(self.eb_root, 'software')
 
         # build all new easyconfigs in a folder tree
@@ -516,7 +561,8 @@ class Builder:
                             print(f'  * checkskipped is set, trying {ebfile} again ...', flush=True) 
                 statdict = self.aws.s3_get_json(f'{self.cfg.archiveroot}/{s3_prefix}/eb-build-status.json')
                 if ebfile not in statdict.keys():
-                    statdict[ebfile] = statdict_template                     
+                    statdict[ebfile] = statdict_template        
+
                 ## first kill other non-functional instances
                 ilist = self.aws.ec2_list_instances('Name', 'AWSEBSelfDestruct')
                 instances = [sublist[1] for sublist in ilist if sublist]
@@ -524,7 +570,9 @@ class Builder:
                     if self.aws.monitor_has_instance_failed(inst, True):
                         print(f'  * Instance {inst} has failed, terminating it ... ', flush=True)
                         self.aws.ec2_terminate_instance(inst)
-                # end instance kill                 
+                # end instance kill       
+
+                ############# check for supported toolchains, included or excluded classes #############
                 name, version, tc, osdep, cls, instdir = self._read_easyconfig(ebpath)                
                 if name in self.min_toolchains.keys(): # if this is the toolchain package itself    
                     if self.cfg.sversion(version) < self.cfg.sversion(self.min_toolchains[name]):
@@ -562,9 +610,14 @@ class Builder:
                         continue
                 if osdep:
                     print(f'  installing OS dependencies: {osdep}', flush=True)
-                    self._install_packages(osdep)
-                # install easybuild package 
+                    self.cfg.install_os_packages(osdep)
+
+                ########## Checking for missing dependencies: easybuild modules ############################
                 themissing = self._eb_missing_modules(ebpath, printout=True)
+                if self.args.debug:
+                    print(f'  * _eb_missing_modules({ebpath}) returned: {themissing}', flush=True)
+                if 'error' in themissing.keys():
+                    print(f'  * _eb_missing_modules({ebpath}) returned an error', flush=True)
                 if not themissing:
                     print(f'  * {ebfile} and dependencies are already installed.', flush=True)
                     statdict[ebfile]['status'] = 'success'
@@ -573,7 +626,7 @@ class Builder:
                     continue
                 errmiss = self._errors_in_missing(themissing, statdict)
                 if errmiss:
-                    print(f'  * {ebfile} has missing dependencies: {", ".join(errmiss)}', flush=True)
+                    print(f'  ******** {ebfile} has missing dependencies with errors: {", ".join(errmiss)}', flush=True)
                     statdict[ebfile]['status'] = 'skipped'
                     statdict[ebfile]['reason'] = 'dependencies have errors'
                     self.aws.s3_put_json(f'{self.cfg.archiveroot}/{s3_prefix}/eb-build-status.json',statdict)
@@ -581,7 +634,10 @@ class Builder:
                 # check if min_toolchains exclude any of the missing modules, if so skip this easyconfig
                 doskip = False
                 for miss in themissing.keys():
-                    nam, ver = miss.split('/')
+                    if '/' in miss:
+                        nam, ver = miss.split('/')
+                    else:
+                        nam, ver = miss, '0.0'
                     if nam in self.min_toolchains.keys():
                         if self.cfg.sversion(ver) < self.cfg.sversion(self.min_toolchains[nam]):
                             print(f'  * {ebfile} requires toolchain {miss} which is too old according to min_toolchains.', flush=True)
@@ -592,66 +648,87 @@ class Builder:
                     self.aws.s3_put_json(f'{self.cfg.archiveroot}/{s3_prefix}/eb-build-status.json',statdict)
                     continue
                 print(f" Downloading previous packages ... ", flush=True)
-                getsource = True
-                if self.args.skipsources:
-                    getsource = False
+                # getsource = True
+                # if self.args.skipsources:
+                #     getsource = False
                 ebskipped-=1
                 if time.time()-downloadtime > self.copydelay:
-                    self.download(f':s3:{self.cfg.archivepath}', self.eb_root, s3_prefix, getsource)
+                    self.download(f':s3:{self.cfg.archivepath}', self.eb_root, s3_prefix) #downloading modules
                     print(f" Unpacking previous packages ... ", flush=True)
-                    all_tars, new_tars = self._untar_eb_software(softwaredir)
+                    #all_tars, new_tars = self._untar_eb_software(softwaredir)
+                    pref = f'{self.cfg.archiveroot}/{s3_prefix}/software'
+                    self.aws.s3_download_untar(self.cfg.bucket, pref, os.path.join(self.eb_root, 'software'), self.args.vcpus*50)
                     downloadtime = time.time()
                 else:
-                    print(f" Skipping download, last download was less than {self.copydelay} seconds ago ... ", flush=True)
-                cmdline = "eb --umask=002"
+                    print(f" Skipping download, last download was less than {self.copydelay} seconds ago ... ", flush=True)                
+                                                
+                ######################### Need to install the dependencies first #############################################
                 depterr = False
                 print(f" Installing dependencies for {ebfile} ... ", flush=True)
-                for ebf in list(themissing.values())[:-1]:  # The last one is the original package, not a dependency
-                    if ebf != ebfile:                        
-                        print(f"  ------------ {ebf} (Dependency) -------------------- ... ", flush=True)
-                        # ebf is the dependency, install the actual package with --robot in the next step
-                        now1=int(time.time())
-                        if 'CUDA' in ebf: # CUDA is a special case, we may not have a GPU installed 
-                            ret = subprocess.run(f'{cmdline} --ignore-test-failure {ebf}', shell=True, text=True)
+                cmdline = "eb --umask=002"
+                for ebf in list(themissing.values())[:-1]:  # Exclude the last one, it is the original package, not a dependency
+                    #if ebf != ebfile:
+                    print(f"  ------------ {ebf} (Dependency) ------------------------ ... ", flush=True)
+                    # install the os dependencies of the eb dependency
+                    try:
+                        pth, ec_dict = self._parse_easyconfig(ebf)                        
+                        deposdep = ec_dict.get('osdependencies', "")
+                        if deposdep:
+                            print(f'  * installing OS dependencies: {deposdep} for {ebf}', flush=True)
+                            self.cfg.install_os_packages(deposdep) 
                         else:
-                            ret = subprocess.run(f'{cmdline} {ebf}', shell=True, text=True)
-                        retcode = ret.returncode
-                        print(f'*** EASYBUILD RETURNCODE: {retcode}', flush=True)
-                        trydate = datetime.datetime.now().astimezone().isoformat()                                        
-                        if ebf not in statdict:
-                            statdict[ebf] = statdict_template                   
-                        statdict[ebf]['returncode'] = int(retcode)
-                        statdict[ebf]['trydate'] = trydate
-                        statdict[ebf]['buildtime'] = int(time.time())-now1
-                        if retcode != 0:
-                            depterr = True
-                            print(f'  FAILED DEPENDENCY: EasyConfig {ebf}, trying next one ...', flush=True)
-                            errcnt+=1
-                            errpkg.append(ebf)
-                            logpath = self._eb_last_log()
-                            logfile = os.path.basename(logpath)
-                            targetlog = os.path.join(self.eb_root, 'tmp', f'{ebf}-{logfile}')
-                            shutil.copy(logpath, targetlog)                      
-                            statdict[ebf]['status'] = 'error'
-                            statdict[ebf]['reason'] = 'n/a'
-                            statdict[ebf]['errorcount'] += 1
-                        else:
-                            print(f'  DEPENDENCY SUCCESS: EasyConfig {ebf} built successfully.', flush=True)
-                            statdict[ebf]['status'] = 'success'
-                            statdict[ebf]['reason'] = 'easyconfig built successfully'
-                            statdict[ebf]['modules'] = None
-                            bldcnt+=1                        
-                        self.aws.s3_put_json(f'{self.cfg.archiveroot}/{s3_prefix}/eb-build-status.json',statdict)
-                        if depterr:
-                            break
+                            print(f'  * no OS dependencies for {ebf}', flush=True)
+                    except Exception as e:
+                        print(f'  * Could not parse easyconfig {ebf}: {e}', flush=True)
+                    # ebf is the dependency, install the actual package with --robot in the next step
+                    now1=int(time.time())
+                    if 'CUDA' in ebf: # CUDA is a special case, we may not have a GPU installed 
+                        print(f'  * running "{cmdline} --ignore-test-failure {ebf}" ... ', flush=True)
+                        ret = subprocess.run(f'{cmdline} --ignore-test-failure {ebf}', shell=True, text=True)
+                    else:
+                        print(f'  * running "{cmdline} {ebf}" ... ', flush=True)
+                        ret = subprocess.run(f'{cmdline} {ebf}', shell=True, text=True)
+                    retcode = ret.returncode
+                    print(f'*** EASYBUILD RETURNCODE: {retcode}', flush=True)
+                    trydate = datetime.datetime.now().astimezone().isoformat()                                        
+                    if ebf not in statdict:
+                        statdict[ebf] = statdict_template                   
+                    statdict[ebf]['returncode'] = int(retcode)
+                    statdict[ebf]['trydate'] = trydate
+                    statdict[ebf]['buildtime'] = int(time.time())-now1
+                    if retcode != 0:
+                        depterr = True
+                        print(f'  FAILED DEPENDENCY: EasyConfig {ebf}, trying next one ...', flush=True)
+                        errcnt+=1
+                        errpkg.append(ebf)
+                        logpath = self._eb_last_log()
+                        logfile = os.path.basename(logpath)
+                        targetlog = os.path.join(self.eb_root, 'tmp', f'{ebf}-{logfile}')
+                        shutil.copy(logpath, targetlog)                      
+                        statdict[ebf]['status'] = 'error'
+                        statdict[ebf]['reason'] = 'n/a'
+                        statdict[ebf]['errorcount'] += 1
+                    else:
+                        print(f'  DEPENDENCY SUCCESS: EasyConfig {ebf} built successfully.', flush=True)
+                        statdict[ebf]['status'] = 'success'
+                        statdict[ebf]['reason'] = 'easyconfig built successfully'
+                        statdict[ebf]['modules'] = None
+                        bldcnt+=1                        
+                    self.aws.s3_put_json(f'{self.cfg.archiveroot}/{s3_prefix}/eb-build-status.json',statdict)
+                    if depterr:
+                        break
                 if depterr:
-                    continue
+                    continue # move to next package if ANY dependency failed
+
+                ######################### Now install the actual package, with dependencies in case some were missed ##############
                 print(f" Installing {ebfile} ({ebpath})... ", flush=True)
                 cmdline = "eb --robot --umask=002"
                 now2=int(time.time())
                 if 'CUDA' in ebfile: # CUDA is a special case, we may not have a GPU installed 
+                    print(f'  * running "{cmdline} --ignore-test-failure {ebpath}" ... ', flush=True)
                     ret = subprocess.run(f'{cmdline} --ignore-test-failure {ebpath}', shell=True, text=True)
                 else:
+                    print(f'  * running "{cmdline} {ebpath}" ... ', flush=True)
                     ret = subprocess.run(f'{cmdline} {ebpath}', shell=True, text=True)
                 retcode = ret.returncode
                 statdict[ebfile]['returncode'] = int(retcode)
@@ -702,6 +779,9 @@ class Builder:
             print(f" Final upload using checksums ... ", flush=True)
             self.rclone_upload_compare = '--checksum'
             self.upload(self.eb_root, f':s3:{self.cfg.archivepath}', s3_prefix)
+            if self.cfg.is_systemd_service_running('redis6') or self.cfg.is_systemd_service_running('redis'):
+                if not self.args.keeprunning:
+                    ret=subprocess.run(f'sudo juicefs umount --flush /mnt/share', shell=True, text=True)
             msg = f'BUILD FINISHED. Tried {ebcnt} viable easyconfigs ({ebskipped} skipped), {bldcnt} packages built, {errcnt} builds failed.'
             if errpkg:
                 msg += f'\nFailed easyconfigs: {", ".join(errpkg)}'
@@ -711,6 +791,20 @@ class Builder:
             pass
         
         return True
+    
+    def _parse_easyconfig(self, ebfile):
+        """
+        Helper function: find and parse easyconfig with specified filename,
+        and return parsed easyconfig file (an EasyConfig instance).
+        """
+        # determine path to easyconfig file
+        ec_path = det_easyconfig_paths([ebfile])[0]
+        # parse easyconfig file;
+        # the 'parse_easyconfigs' function expects a list of tuples,
+        # where the second item indicates whether or not the easyconfig file was automatically generated or not
+        ec_dicts, _ = parse_easyconfigs([(ec_path, False)])
+        # only retain first parsed easyconfig, ignore any others (which are unlikely anyway)
+        return ec_path, ec_dicts[0]['ec']
 
     def _eb_last_log(self):
         command = ['eb', '--last-log']
@@ -726,7 +820,7 @@ class Builder:
             output = subprocess.check_output(command, text=True)
         except subprocess.CalledProcessError as e:
             print(f"Error executing command: {e}")
-            return {}
+            return {'error': 1}
         # Print raw output if the option is enabled
         if printout:
             print("Raw output of 'eb --missing-modules':")
@@ -752,10 +846,12 @@ class Builder:
                         errlist.append(ebf)
         return errlist
         
-    def _install_os_dependencies(self, easyconfigroot):
+    def _install_os_dependencies(self, easyconfigroot, minimal=False):
         # install OS dependencies from all easyconfigs (~ 400 packages)        
         package_skip_set = set() # avoid duplicates
-        self._install_packages(['pigz', 'iftop', 'iotop'], package_skip_set)        
+        self.cfg.install_os_packages(['golang', 'pigz', 'iftop', 'iotop', 'htop', 'fuse3'], package_skip_set)
+        if minimal:
+            return True
         for root, dirs, files in self.cfg._walker(easyconfigroot):
             print(f'  Processing folder "{root}" for OS depts... ')
             for ebfile in files:
@@ -764,12 +860,13 @@ class Builder:
                     _, _, _, dep, _, _ = self._read_easyconfig(ebpath)
                     if dep:
                         print(f'  installing OS dependencies: {dep}')
-                        self._install_packages(dep, package_skip_set)
+                        self.cfg.install_os_packages(dep, package_skip_set)
                         for package_tuple in dep: # avoid duplicates
                             if isinstance(package_tuple, str):
                                 package_tuple = (package_tuple,)                            
                             for package_name in package_tuple:
                                 package_skip_set.add(package_name)
+        return True
 
     def _tar_folder_old(self, folder):
         # Ensure the directory exists
@@ -805,6 +902,10 @@ class Builder:
 
                 if self.args.debug:
                     self.cfg.printdbg(f'version_dir: {version_dir}, package_dir: {package_dir}, package_root: {package_root}, tarball_name: {tarball_name}, tarball_path: {tarball_path}')   
+                
+                if os.path.exists(f'{tarball_path}.stub'):
+                    print(f'  {tarball_path} was previously downloaded, skipping ...')
+                    continue
 
                 all_tars.append(tarball_path)
                 if os.path.isfile(tarball_path):
@@ -836,32 +937,37 @@ class Builder:
         new_tars = []
         all_tars = []
 
+        subprocess.run(['untar', folder, self.args.vcpus*100])
+        return all_tars, new_tars
+
         def untar_file(file_path, root):
             print(f"Unpacking {file_path} into {root}...", flush=True)
             try:
-                # Check if pigz is available
-                if shutil.which("pigz"):
-                    decompress_command = f"pigz -p {self.args.vcpus}"
-                else:
-                    # Fallback to gzip if pigz is not available
-                    decompress_command = "gzip -d"
+                # # Check if pigz is available
+                # if shutil.which("pigz"):
+                #     decompress_command = f"pigz -p {self.args.vcpus}"
+                # else:
+                #     # Fallback to gzip if pigz is not available
+                #     decompress_command = "gzip -d"
 
-                # Decompress and unpack the file
-                subprocess.run([
-                    "tar",
-                    "-I", decompress_command,
-                    "-xf", file_path,
-                    "-C", root 
-                ], check=True)
+                # # Decompress and unpack the file
+                # subprocess.run([
+                #     "tar",
+                # #    "-I", decompress_command,
+                #     "-xf", file_path,
+                #     "-C", root 
+                # ], check=True)
+                with tarfile.open(file_path, 'r:gz') as tar:
+                    tar.extractall(path=root)
                 print(f"Successfully unpacked: {file_path}")
-                return file_path
-            except subprocess.CalledProcessError as e:
+                return file_path            
+            #except subprocess.CalledProcessError as e:
+            except tarfile.TarError as e:            
                 print(f"untar_file: An error occurred while unpacking {file_path}: {e}")
                 return False
             except Exception as e:
                 print(f"untar_file: An error occurred while unpacking {file_path}: {e}")
-                return
-            return True
+                return False
 
         # Create a list of tasks for parallel execution
         tasks = []
@@ -878,7 +984,7 @@ class Builder:
                         tasks.append((file_path, root))
 
         # Execute the tasks in parallel using ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=self.args.vcpus) as executor:
+        with ThreadPoolExecutor(max_workers=self.args.vcpus*100) as executor:
             future_to_file = {executor.submit(untar_file, file_path, root): file_path for file_path, root in tasks}
             for future in as_completed(future_to_file):
                 file_path = future_to_file[future]
@@ -929,12 +1035,12 @@ class Builder:
         latest_version = sorted(version_file_dict.keys(), key=sort_key, reverse=True)[0]
         return version_file_dict[latest_version]
 
-    def _read_easyconfig(self, ebfile):
+    def _read_easyconfig(self, ebpath):
         
         ec_dict = {}
         try:
             # Initialize EasyConfigParser with the easyconfig file
-            ec_dict = EasyConfigParser(ebfile).get_config_dict()
+            ec_dict = EasyConfigParser(ebpath).get_config_dict()
             #module_file = EasyBuildMNS().det_full_module_name(ec)
             #print (module_file)
         except EasyBuildError as e:
@@ -955,67 +1061,23 @@ class Builder:
 
         return name, version, toolchain, ec_dict.get('osdependencies', ""), ec_dict.get('moduleclass', ""), install_dir
 
-    def _get_os_type(self):
-        os_info = {}
-        if os.path.isfile("/etc/os-release"):
-            with open("/etc/os-release") as f:
-                for line in f:
-                    key, value = line.strip().split("=", 1)
-                    os_info[key] = value.strip('"')
-        # Prioritize ID_LIKE over ID
-        os_type = os_info.get('ID_LIKE', os_info.get('ID', None))
-        # Handle the case where ID_LIKE can contain multiple space-separated strings
-        if os_type and ' ' in os_type:
-            os_type = os_type.split(' ')[0]  # Get the first 'like' identifier
-        return os_type
-
-    def _install_packages(self, os_dependencies, package_skip_set=[]):
-        os_type = self._get_os_type()        
-        # Determine the appropriate package manager for the detected OS type
-        package_manager = None
-        if os_type in ['debian', 'ubuntu']:
-            package_manager = 'apt'
-        elif os_type in ['fedora', 'centos', 'redhat', 'rhel']:
-            package_manager = 'dnf'
-        
-        if not package_manager:
-            print("Unsupported operating system.")
-            return
-        
-        for package_tuple in os_dependencies:
-            if isinstance(package_tuple, str):
-                package_tuple = (package_tuple,)
-            installed = False
-            for package_name in package_tuple:
-                # Check if the package has a known OS-specific suffix
-                if package_name in package_skip_set:
-                    print(f"Skipping {package_name} because it was already installed.")
-                    continue
-                if (package_name.endswith('-dev') and os_type in ['debian', 'ubuntu']) or \
-                (package_name.endswith('-devel') and os_type in ['fedora', 'centos', 'redhat']):
-                    try:
-                        print(f"Installing {package_name} with {package_manager}")                    
-                        subprocess.run(['sudo', package_manager, 'install', '-y', package_name], check=True)
-                        installed = True
-                        break
-                    except subprocess.CalledProcessError:
-                        pass
-            
-            # If none of the packages in the tuple had a suffix, we try to install each until one succeeds
-            if not installed:
-                for package_name in package_tuple:
-                    if package_name in package_skip_set:
-                        print(f"Skipping {package_name} because it was already installed.")
-                        continue                    
-                    try:
-                        print(f"Attempting to install {package_name} with {package_manager}")
-                        subprocess.run(['sudo', package_manager, 'install', '-y', package_name], check=True)
-                        print(f"Installed {package_name} successfully.")
-                        break  # Stop trying after the first successful install
-                    except subprocess.CalledProcessError:
-                        # If the package installation failed, it might be the wrong package for the OS,
-                        # so continue trying the next packages in the tuple
-                        pass
+    def _parse_easyconfig(self, ebfile):
+        """
+        Helper function: find and parse easyconfig with specified filename,
+        and return parsed easyconfig file (an EasyConfig instance).
+        """
+        try:
+            # determine path to easyconfig file
+            ec_path = det_easyconfig_paths([ebfile])[0]
+            # parse easyconfig file;
+            # the 'parse_easyconfigs' function expects a list of tuples,
+            # where the second item indicates whether or not the easyconfig file was automatically generated or not
+            ec_dicts, _ = parse_easyconfigs([(ec_path, False)])
+            # only retain first parsed easyconfig, ignore any others (which are unlikely anyway)
+            return ec_path, ec_dicts[0]['ec']
+        except EasyBuildError as e:
+            print("Error in _parse_easyconfig:", e)
+            return None, None
 
     def upload(self, source, target, s3_prefix):
 
@@ -1079,7 +1141,7 @@ class Builder:
         # after the first successful upload do a size only compare
         self.rclone_upload_compare  = '--size-only'
                 
-    def download(self, source, target, s3_prefix=None, with_source=True):
+    def download(self, source, target, s3_prefix=None):  #, with_source=True
                
         rclone = Rclone(self.args,self.cfg)
             
@@ -1090,24 +1152,28 @@ class Builder:
                         )
         self._transfer_status(ret)
 
-        if with_source:
-            print ('  Downloading Sources ... ', flush=True)
-            ret = rclone.copy(f'{source}/sources/',
-                            os.path.join(target,'sources'), '--fast-list',
-                            '--links', self.rclone_download_compare
-                            )
-            self._transfer_status(ret)
+        # sources are mounted from rclone
+        #
+        # 
+        #     print ('  Downloading Sources ... ', flush=True)
+        #     ret = rclone.copy(f'{source}/sources/',
+        #                     os.path.join(target,'sources'), '--fast-list',
+        #                     '--links', self.rclone_download_compare
+        #                     )
+        #     self._transfer_status(ret)
             
-            self._make_files_executable(os.path.join(target,'sources','generic'))
+        #     self._make_files_executable(os.path.join(target,'sources','generic'))
 
-        print ('  Downloading Software ... ', flush=True)
-        ret = rclone.copy(f'{source}/{s3_prefix}/software/',
-                          os.path.join(target,'software'), '--fast-list',
-                          '--links', self.rclone_download_compare, 
-                          '--include', '*.eb.tar.gz' 
-                        )
-        self._transfer_status(ret)
-        
+        # we are now using s3 native for untar on-the-fly
+        #
+        # print ('  Downloading Software ... ', flush=True)
+        # ret = rclone.copy(f'{source}/{s3_prefix}/software/',
+        #                   os.path.join(target,'software'), '--fast-list',
+        #                   '--links', self.rclone_download_compare, 
+        #                   '--include', '*.eb.tar.gz' 
+        #                 )        
+        # self._transfer_status(ret)
+            
         # for subsequent download comparison size is enough
         self.rclone_download_compare = '--size-only'
    
@@ -1303,13 +1369,14 @@ class Rclone:
             #os.chmod(mountpoint, 0o2775)
             current_permissions = os.stat(mountpoint).st_mode
             new_permissions = (current_permissions & ~0o07) | 0o05
-            os.chmod(mountpoint, new_permissions)            
+            os.chmod(mountpoint, new_permissions) 
         except:
             pass
         command.append('--allow-non-empty')
-        command.append('--default-permissions')
-        command.append('--read-only')
+        #command.append('--default-permissions')
+        #command.append('--read-only')
         command.append('--no-checksum')
+        command.append('--file-perms=0775')
         command.append('--quiet')
         command.append(url)
         command.append(mountpoint)
@@ -1414,6 +1481,7 @@ class AWSBoto:
         self.args = args
         self.cfg = cfg
         self.awsprofile = self.cfg.awsprofile
+        self.scriptname = os.path.basename(__file__)
         self.cpu_types = {
             "graviton-2": ('c6g', 'c6gd', 'c6gn', 'm6g', 'm6gd', 'r6g', 'r6gd', 't4g' ,'g5g'),
             "graviton-3": ('c7g', 'c7gd', 'c7gn', 'm7g', 'm7gd', 'r7g', 'r7gd'),
@@ -1428,6 +1496,23 @@ class AWSBoto:
             "xeon-gen-4": ('c7i', 'm7i', 'm7i-flex', 'r7i', 'r7iz'),
             "core-i7-mac": ('mac1',)
         }
+
+        # not used yet
+        self.cpu_speed = {
+            "graviton-2": 10,
+            "graviton-3": 10,
+            "graviton-4": 10,
+            "epyc-gen-1": 50,
+            "epyc-gen-2": 66,
+            "epyc-gen-3": 85,
+            "epyc-gen-4": 100,
+            "xeon-gen-1": 10,
+            "xeon-gen-2": 10,
+            "xeon-gen-3": 10,
+            "xeon-gen-4": 10,
+            "core-i7-mac": 21
+        }
+
         self.gpu_types = {
             "h100": 'p5',
             "a100": 'p4',
@@ -1784,6 +1869,87 @@ class AWSBoto:
             print(f"Error in s3_duplicate_bucket(): {e}")
             return False
 
+    def s3_download_untar(self, src_bucket, prefix, dst_root, max_workers=100):
+
+        s3 = self.awssession.client('s3')
+        if not prefix.endswith('/'):
+            prefix += '/'
+
+        def s3_untar_object(s3, src_bucket, prefix, obj, dst_root):
+            try:
+                if obj['Key'].endswith('.eb.tar.gz'):
+                    tail = obj['Key'][len(prefix):]
+                    dst_fld = os.path.dirname(os.path.join(dst_root,tail))
+                    stub_file = os.path.join(dst_root,tail) + '.stub'
+                    if os.path.exists(stub_file):
+                        print(f"   Skiping {obj['Key']} ... already extracted")
+                        return
+                    else:
+                        print(f"   Extr. {obj['Key']} ...")
+                    if not os.path.exists(dst_fld):
+                        os.makedirs(dst_fld, exist_ok=True)              
+                    fobj = s3.get_object(Bucket=src_bucket, Key=obj['Key'], RequestPayer='requester')
+                    stream = fobj['Body']
+                    with tarfile.open(mode="r|gz", fileobj=stream._raw_stream) as tar:
+                        for member in tar:
+                            # Extract each member while preserving attributes
+                            tar.extract(member, path=dst_fld)                
+                    # Alternative method using BytesIO but consumes much more memory
+                    # tar_obj = tarfile.open(fileobj=io.BytesIO(stream.read()), mode="r:gz")
+                    # tar_obj.extractall(path=dst_fld)
+                    #
+                    # Some extracted files may have wrong permissions, fix them, add rw to owner
+                    for root, dirs, files in self.cfg._walker(dst_fld):
+                        for name in dirs + files:
+                            full_path = os.path.join(root, name)
+                            current_permissions = os.stat(full_path).st_mode
+                            # Preserve the owner's execute bit if it's set, only modify read and write bits
+                            owner_execute = current_permissions & 0o100  # Owner execute bit
+                            new_permissions = (current_permissions & 0o7077) | 0o600 | owner_execute
+                            os.chmod(full_path, new_permissions)
+                    with open(stub_file, 'w') as fil:
+                        pass 
+                else:
+                    print(f"**** Skipping {obj['Key']}, not a tar.gz file.")
+
+            except Exception as e:
+                print(f"Error in s3_untar_object: {e}")
+                if "seeking backwards is not allowed" in str(e):
+                    print(f"**** Skipping {obj['Key']}, overwriting not allowed")
+                return False
+
+        try:
+            paginator = s3.get_paginator('list_objects_v2')
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:            
+                # Iterate over each page in the paginator
+                for page in paginator.paginate(Bucket=src_bucket, Prefix=prefix, RequestPayer='requester'):
+                    if 'Contents' in page:
+                        # Submit each object copy to the thread pool
+                        futures = [executor.submit(s3_untar_object, s3, src_bucket, prefix, obj, dst_root)
+                                for obj in page['Contents']] # if obj['Size'] <= 5 * 1024 * 1024 * 1024
+                        # Wait for all submitted futures to complete
+                        concurrent.futures.wait(futures)
+        except Exception as e:
+            print(f"Error in s3_download_untar: {e}")
+            return False
+
+    def s3_get_size_gb(self, bucket, prefix):
+        try:
+            s3 = self.awssession.client('s3')
+            if not prefix.endswith('/'):
+                prefix += '/'
+            total_size_bytes = 0
+            paginator = s3.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        total_size_bytes += obj['Size']
+            total_size_gib = total_size_bytes / (2**30)
+            return total_size_gib
+        except Exception as e:
+            print(f"Error in s3_get_size_gb: {e}")
+            return 0
+
     def _extract_last_float(self, input_string):
         # Finding all occurrences of a floating-point number pattern
         matches = re.findall(r'\d+\.\d+', input_string)
@@ -1823,28 +1989,29 @@ class AWSBoto:
             cmdlist.insert(2, self.args.awsprofile)
         if not '--build' in cmdlist:
            cmdlist.append('--build')
-        cmdline = 'aws-eb ' + " ".join(map(shlex.quote, cmdlist[1:])) #original cmdline
+        cmdline = self.scriptname + " " + " ".join(map(shlex.quote, cmdlist[1:])) #original cmdline
         ### end block 
 
         print(f" will execute '{cmdline}' on {ip} ... ")
-        bootstrap_build += '\n' + cmdline + f' >> ~/out.easybuild.{ip}.txt 2>&1'        
+        bootstrap_build += '\n$PYBIN ~/.local/bin/' + cmdline + f' >> ~/out.easybuild.{ip}.txt 2>&1'        
         # once everything is done, commit suicide, but only if ~/no-terminate does not exist:
-        bootstrap_build += f'\n[ ! -f ~/no-terminate ] && aws-eb ssh --terminate {iid}'
+        if not self.args.keeprunning:
+            bootstrap_build += f'\n[ ! -f ~/no-terminate ] && $PYBIN ~/.local/bin/{self.scriptname} ssh --terminate {iid}'
         sshuser = self.ec2_get_default_user(ip)
         ret = self.ssh_upload(sshuser, ip,
             self._ec2_easybuildrc(), "easybuildrc", is_string=True)
         ret = self.ssh_upload(sshuser, ip,
             bootstrap_build, "bootstrap.sh", is_string=True)        
-        if ret.stdout or ret.stderr:
-            print(ret.stdout, ret.stderr)
+        #if ret.stdout or ret.stderr:
+            #print(ret.stdout, ret.stderr)
         ret = self.ssh_execute(sshuser, ip, 
             'mkdir -p ~/.config/aws-eb/general')
         if ret.stdout or ret.stderr:
             print(ret.stdout, ret.stderr)        
         ret = self.ssh_upload(sshuser, ip,
             "~/.config/aws-eb/general/*", ".config/aws-eb/general/")
-        if ret.stdout or ret.stderr:
-            print(ret.stdout, ret.stderr)        
+        #if ret.stdout or ret.stderr:
+            #print(ret.stdout, ret.stderr)        
         ret = self.ssh_execute(sshuser, ip, 
             f'nohup bash bootstrap.sh < /dev/null > out.bootstrap.{ip}.txt 2>&1 &')
         if ret.stdout or ret.stderr:
@@ -1865,7 +2032,8 @@ class AWSBoto:
         ret = self.ssh_upload(sshuser, ip,
             "~/.bash_history.tmp", ".bash_history")
         if ret.stdout or ret.stderr:
-            print(ret.stdout, ret.stderr)
+            #print(ret.stdout, ret.stderr)
+            pass
 
         self.send_email_ses('', '', 'AWS-EB build on EC2', f'this command line was executed on host {ip}:\n{cmdline}')
 
@@ -2410,10 +2578,12 @@ class AWSBoto:
         long_timezone = self.cfg.get_time_zone()
         userdata = textwrap.dedent(f'''
         #! /bin/bash
-        {pkgm} update -y
-        export DEBIAN_FRONTEND=noninteractive
-        {pkgm} install -y gcc mdadm jq
         format_largest_unused_block_devices() {{
+            # format the largest unused block device(s) and mount it to /opt or /mnt/scratch
+            # if there are multiple unused devices of the same size and their combined size 
+            # is larger than the largest unused single block device, they will be combined into 
+            # a single RAID0 device and be mounted instead of the largest device
+            #
             # Get all unformatted block devices with their sizes
             local devices=$(lsblk --json -n -b -o NAME,SIZE,FSTYPE,TYPE | jq -r '.blockdevices[] | select(.children == null and .type=="disk" and .fstype == null and (.name | tostring | startswith("loop") | not) ) | {{name, size}}')
             # Check if there are any devices to process
@@ -2438,35 +2608,54 @@ class AWSBoto:
                 local largest_device=$(echo "$best_config" | jq -r '.devices[0]')
                 echo "/dev/$largest_device"
                 mkfs -t xfs "/dev/$largest_device"
-                mount "/dev/$largest_device" /opt
+                mkdir -p $1
+                mount "/dev/$largest_device" $1
+                sleep 5
             elif [[ "$count" -gt 1 ]]; then
                 # Multiple devices of the same size
                 local devices_list=$(echo "$best_config" | jq -r '.devices[]' | sed 's/^/\/dev\//')
                 echo "Devices with the largest combined size: $devices_list"
                 mdadm --create /dev/md0 --level=0 --raid-devices=$count $devices_list
                 mkfs -t xfs /dev/md0
-                mount /dev/md0 /opt
+                mkdir -p $1
+                mount /dev/md0 $1
+                sleep 5
             else
                 echo "No uniquely largest block device found."
             fi
         }}
+        {pkgm} update -y
+        export DEBIAN_FRONTEND=noninteractive
+        {pkgm} install -y redis6 
+        {pkgm} install -y redis
+        {pkgm} install -y python3.11-pip python3.11-devel      
+        {pkgm} install -y gcc mdadm jq git python3-pip
+        format_largest_unused_block_devices /opt
         chown {self.cfg.defuser} /opt
-        format_largest_unused_block_devices
-        chown {self.cfg.defuser} /opt
+        format_largest_unused_block_devices /mnt/scratch
+        chown {self.cfg.defuser} /mnt/scratch
+        if [[ -f /usr/bin/redis6-server ]]; then
+          systemctl enable redis6
+          #systemctl restart redis6  #disables juicefs on Amazon linux
+        fi
+        if [[ -f /usr/bin/redis-server ]]; then
+          systemctl enable redis
+          # systemctl restart redis #disables juicefs on RHEL/Ubuntu
+        fi
         dnf config-manager --enable crb # enable powertools for RHEL
         {pkgm} install -y epel-release
         {pkgm} check-update
         {pkgm} update -y                                   
-        {pkgm} install -y at gcc vim wget python3-pip python3-psutil
+        {pkgm} install -y at gcc vim wget python3-psutil
         hostnamectl set-hostname aws-eb
         timedatectl set-timezone '{long_timezone}'
         loginctl enable-linger {self.cfg.defuser}
         systemctl start atd
         {pkgm} upgrade -y
         {pkgm} install -y Lmod
-        {pkgm} install -y mc git docker nodejs-npm
+        {pkgm} install -y mc docker nodejs-npm
         {pkgm} install -y lua lua-posix lua-devel tcl-devel
-        {pkgm} install -y build-essential rpm2cpio tcl-dev tcl #lmod #Ubuntu 22.04 only has lmod 6.6 and EB5 requires 7.0
+        {pkgm} install -y build-essential rpm2cpio tcl-dev tcl #lmod #Ubuntu 22.04 only has lmod 6.6 and EB5 requires 8.0
         {pkgm} install -y lua5.3 lua-bit32 lua-posix lua-posix-dev liblua5.3-0 liblua5.3-dev tcl8.6 tcl8.6-dev libtcl8.6
         dnf group install -y 'Development Tools'
         cd /tmp
@@ -2492,6 +2681,7 @@ class AWSBoto:
         export EASYBUILD_CUDA_COMPUTE_CAPABILITIES=7.5,8.0,8.6,9.0
         # export EASYBUILD_BUILDPATH=/dev/shm/$USER # could run out of space
         export EASYBUILD_PREFIX=/opt/eb
+        export EASYBUILD_SOURCEPATH=${{EASYBUILD_PREFIX}}/sources:${{EASYBUILD_PREFIX}}/sources_s3
         export EASYBUILD_JOB_OUTPUT_DIR=$EASYBUILD_PREFIX/batch-output
         export EASYBUILD_DEPRECATED=5.0
         export EASYBUILD_JOB_BACKEND=Slurm
@@ -2513,24 +2703,35 @@ class AWSBoto:
             emailaddr = 'user@domain.edu'
         #short_timezone = datetime.datetime.now().astimezone().tzinfo
         long_timezone = self.cfg.get_time_zone()
+        juiceid = f'juice{instance_id.replace("-","")}'
         return textwrap.dedent(f'''
         #! /bin/bash
         echo "Bootstrapping AWS-EB on {instance_id} ..."
         if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
-            export PATH=$PATH:~/.local/bin
-            echo 'export PATH=$PATH:~/.local/bin' >> ~/.bashrc
+            export PATH=~/.local/bin:$PATH
+            echo 'export PATH=~/.local/bin:$PATH' >> ~/.bashrc
         fi
         mkdir -p ~/.config/aws-eb
+        mkdir -p ~/.local/bin
         echo 'PS1="\\u@aws-eb:\\w$ "' >> ~/.bashrc
         echo 'source ~/easybuildrc' >> ~/.bashrc
         echo '#export EC2_INSTANCE_ID={instance_id}' >> ~/.bashrc
         echo '#export AWS_DEFAULT_REGION={self.cfg.aws_region}' >> ~/.bashrc
         echo '#export TZ={long_timezone}' >> ~/.bashrc
-        echo '#alias singularity="apptainer"' >> ~/.bashrc        
+        echo '#alias singularity="apptainer"' >> ~/.bashrc
+        # Install JuiceFS
+        curl -sSL https://d.juicefs.com/install | sh -
         # wait for pip3 to be installed
-        echo "Waiting for Python3 pip install ..."
-        until [ -f /usr/bin/pip3 ]; do sleep 5; done; echo "pip3 exists, please wait ..."    
-        python3 -m pip install --upgrade wheel awscli
+        echo "Waiting for Python3 pip install ..."        
+        until [ -f /usr/bin/pip3 ]; do sleep 3; done; echo "pip3 exists, please wait ..."
+        sleep 5
+        export PYBIN=/usr/bin/python3
+        if [[ -f /usr/bin/python3.11 ]]; then
+          export PYBIN=/usr/bin/python3.11
+          ln -s /usr/bin/python3.11 ~/.local/bin/python3
+        fi
+        $PYBIN -m pip install --upgrade --user pip
+        $PYBIN -m pip install --upgrade --user wheel awscli
         aws configure set aws_access_key_id {os.environ['AWS_ACCESS_KEY_ID']}
         aws configure set aws_secret_access_key {os.environ['AWS_SECRET_ACCESS_KEY']}
         aws configure set region {self.cfg.aws_region}
@@ -2544,27 +2745,46 @@ class AWSBoto:
         echo '#! /bin/bash' > ~/.local/bin/get-public-ip
         echo 'ETOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")' >> ~/.local/bin/get-public-ip
         cp -f ~/.local/bin/get-public-ip ~/.local/bin/get-local-ip
+        cp -f ~/.local/bin/get-public-ip ~/.local/bin/spot-termination-time
         echo 'curl -sH "X-aws-ec2-metadata-token: $ETOKEN" http://169.254.169.254/latest/meta-data/public-ipv4' >> ~/.local/bin/get-public-ip
         echo 'curl -sH "X-aws-ec2-metadata-token: $ETOKEN" http://169.254.169.254/latest/meta-data/local-ipv4' >> ~/.local/bin/get-local-ip
+        echo 'curl -sH "X-aws-ec2-metadata-token: $ETOKEN" http://169.254.169.254/latest/meta-data/spot/termination-time' >> ~/.local/bin/spot-termination-time
         chmod +x ~/.local/bin/get-public-ip
         chmod +x ~/.local/bin/get-local-ip
-        # curl https://raw.githubusercontent.com/dirkpetersen/scibob/main/install.sh | bash 
-        curl -Ls https://raw.githubusercontent.com/dirkpetersen/scibob/main/aws-eb.py?token=$(date +%s) -o ~/.local/bin/aws-eb
-        #curl -Ls https://raw.githubusercontent.com/dirkpetersen/dptests/main/aws-eb/aws-eb.py?token=$(date +%s) -o ~/.local/bin/aws-eb.py
+        chmod +x ~/.local/bin/spot-termination-time
+        curl -Ls https://raw.githubusercontent.com/dirkpetersen/scibob/main/aws-eb.py?token=$(date +%s) -o ~/.local/bin/{self.scriptname}
+        #curl -Ls https://raw.githubusercontent.com/dirkpetersen/dptests/main/aws-eb/aws-eb.py?token=$(date +%s) -o ~/.local/bin/{self.scriptname}
+        #curl -Ls https://raw.githubusercontent.com/dirkpetersen/dptests/main/aws-eb/untar.go?token=$(date +%s) -o ~/.local/bin/untar.go
         curl -Ls https://raw.githubusercontent.com/dirkpetersen/dptests/main/simple-benchmark.py?token=$(date +%s) -o ~/.local/bin/simple-benchmark.py
-        chmod +x ~/.local/bin/aws-eb
-        chmod +x ~/.local/bin/aws-eb.py
+        chmod +x ~/.local/bin/{self.scriptname}
         chmod +x ~/.local/bin/simple-benchmark.py
-        simple-benchmark.py > ~/out.simple-benchmark.txt &
+        $PYBIN ~/.local/bin/simple-benchmark.py > ~/out.simple-benchmark.txt &
         # wait for lmod to be installed
         echo "Waiting for Lmod install ..."
         until [ -f /usr/share/lmod/lmod/init/bash ]; do sleep 3; done; echo "lmod exists, please wait ..."
+        if systemctl is-active --quiet redis6 || systemctl is-active --quiet redis; then
+          juicefs format --storage s3 --bucket https://s3.{self.cfg.aws_region}.amazonaws.com/{self.cfg.bucket} redis://localhost:6379 {juiceid}
+          juicefs config -y --access-key={os.environ['AWS_ACCESS_KEY_ID']} --secret-key={os.environ['AWS_SECRET_ACCESS_KEY']} --trash-days 0 redis://localhost:6379
+          sudo mkdir -p /mnt/share
+          cachedir=/opt/jfsCache
+          if [[ -d /mnt/scratch ]]; then
+            cachedir=/mnt/scratch/jfsCache
+          fi
+          sudo /usr/local/bin/juicefs mount -d --cache-dir $cachedir --writeback --cache-size 102400 redis://localhost:6379 /mnt/share # --max-uploads 100 --cache-partial-only
+          sudo chown {self.cfg.defuser} /mnt/share       
+          #juicefs destroy -y redis://localhost:6379 {juiceid}
+          sed -i 's/--access-key=[^ ]*/--access-key=xxx /' {bscript}
+          sed -i 's/--secret-key=[^ ]*/--secret-key=yyy /' {bscript}
+          sed -i 's/^  juicefs config /#&/' {bscript}
+        fi
         mkdir -p /opt/eb/tmp
+        mkdir -p /opt/eb/sources_s3 # rclone mount point 
         git clone https://github.com/easybuilders/easybuild-easyconfigs  
-        python3 -m pip install easybuild 
-        python3 -m pip install packaging boto3
+        $PYBIN -m pip install --user easybuild 
+        $PYBIN -m pip install --user --upgrade packaging boto3 requests 
+        $PYBIN -m pip install --user psutil
         source ~/easybuildrc
-        aws-eb config --monitor '{emailaddr}'
+        $PYBIN ~/.local/bin/{self.scriptname} config --monitor '{emailaddr}'
         echo ""
         echo -e "CPU info:"
         lscpu | head -n 20
@@ -2578,17 +2798,19 @@ class AWSBoto:
         client = session.client('ec2')
         
         # Define the block device mapping for an EBS volume to be attached to the instance
-        block_device_mappings = [
-        {
-            'DeviceName': '/dev/sdm',  # Ensure that this device name is supported and free in your EC2 instance
-            'Ebs': {
-                'VolumeSize': disk_gib,  # Volume size in GiB (1 TB = 1024 GiB)
-                'DeleteOnTermination': True,  # True if the volume should be deleted after instance is terminated
-                'VolumeType': 'gp3',  # The type of volume to create (gp3 is generally a good default)
-                'Iops': 3000,  # Provisioned IOPS for the volume
-                'Throughput': 750,  # Throughput in MB/s
-            },
-        }]
+        block_device_mappings = []
+        if disk_gib > 0:
+            block_device_mappings = [
+            {
+                'DeviceName': '/dev/sdm',  # Ensure that this device name is supported and free in your EC2 instance
+                'Ebs': {
+                    'VolumeSize': disk_gib,  # Volume size in GiB (1 TB = 1024 GiB)
+                    'DeleteOnTermination': True,  # True if the volume should be deleted after instance is terminated
+                    'VolumeType': 'gp3',  # The type of volume to create (gp3 is generally a good default)
+                    'Iops': 3000,  # Provisioned IOPS for the volume
+                    'Throughput': 750,  # Throughput in MB/s
+                },
+            }]
                      
         if not instance_type:
             print("No suitable instance type found!")
@@ -2917,18 +3139,18 @@ class AWSBoto:
         if command:
             cmd += f" '{command}'"
             try:
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+                result = subprocess.run(cmd, shell=True, text=True) #capture_output=True
                 return result
             except:
                 print(f'Error executing "{cmd}."')
         else:
-            subprocess.run(cmd, shell=True, capture_output=False, text=True)
+            subprocess.run(cmd, shell=True, text=True) #capture_output=False
         self.cfg.printdbg(f'ssh command line: {cmd}')
         return None
                 
-    def ssh_upload(self, user, host, local_path, remote_path, is_string=False):
+    def ssh_upload(self, user, host, local_path, remote_path, is_string=False, cap_output=True):
         """Upload a file to the remote server using SCP."""
-        SSH_OPTIONS = "-o StrictHostKeyChecking=no"
+        SSH_OPTIONS = "-o StrictHostKeyChecking=no -o BatchMode=yes"
         awsacc, _, username = self.get_aws_account_and_user_id()
         key_path = os.path.join(self.cfg.config_root,'cloud',
                 f'{self.cfg.ssh_key_name}-{awsacc}-{username}.pem')
@@ -2937,29 +3159,29 @@ class AWSBoto:
             with tempfile.NamedTemporaryFile(mode='w+', delete=False) as temp:
                 temp.write(local_path)
                 local_path = temp.name
-        cmd = f"scp {SSH_OPTIONS} -i '{key_path}' {local_path} {user}@{host}:{remote_path}"        
+        cmd = f"scp {SSH_OPTIONS} -i '{key_path}' {local_path} {user}@{host}:{remote_path}"
+        #cmdlist = shlex.split(cmd)        
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = subprocess.run(cmd, shell=True, text=True, capture_output=cap_output)
             if is_string:
-                os.remove(local_path)
-            return result       
-        except:
-            print(f'Error executing "{cmd}."')
+                os.remove(local_path)            
+            return result            
+        except Exception as e:
+            print(f'Error executing "{cmd}" in ssh_upload: {e}')
         return None
 
-    def ssh_download(self, user, host, remote_path, local_path):
+    def ssh_download(self, user, host, remote_path, local_path, cap_output=True):
         """Upload a file to the remote server using SCP."""
-        SSH_OPTIONS = "-o StrictHostKeyChecking=no"
+        SSH_OPTIONS = "-o StrictHostKeyChecking=no -o BatchMode=yes"
         awsacc, _, username = self.get_aws_account_and_user_id()
         key_path = os.path.join(self.cfg.config_root,'cloud',
                 f'{self.cfg.ssh_key_name}-{awsacc}-{username}.pem')
-        print(key_path)
         cmd = f"scp {SSH_OPTIONS} -i '{key_path}' {user}@{host}:{remote_path} {local_path}"        
         try:
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            result = subprocess.run(cmd, shell=True, text=True, capture_output=cap_output)
             return result
-        except:
-            print(f'Error executing "{cmd}."')
+        except Exception as e:
+            print(f'Error executing "{cmd}" in ssh_download: {e}')
         return None            
 
     def ssh_add_key_to_remote_host(self, private_key_path, user, host):
@@ -3579,6 +3801,7 @@ class ConfigManager:
         if not self._set_env_vars(self.awsprofile):
             self.awsprofile = ''
         self.ssh_key_name = 'aws-eb-ec2'
+        self.scriptname = os.path.basename(__file__)
         
     def _set_env_vars(self, profile):
         
@@ -3675,6 +3898,22 @@ class ConfigManager:
         except Exception as e:
             # Return two empty strings in case of an error
             return "", ""
+        
+
+    def is_systemd_service_running(self, service_name):
+        if not service_name.endswith('.service'):
+            service_name += '.service'
+        try:
+            # Run the systemctl command to check the service status
+            result = subprocess.run(['systemctl', 'is-active', service_name], stdout=subprocess.PIPE, text=True)            
+            # The output will be 'active' if the service is running
+            if result.stdout.strip() == 'active':
+                return True
+            else:
+                return False
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return False
 
     def _get_home_paths(self):
         path_dirs = os.environ['PATH'].split(os.pathsep)
@@ -3707,6 +3946,69 @@ class ConfigManager:
             return os.path.join(section_path, entry)
         else:
             return os.path.join(self.config_root, entry)
+
+    def _get_os_type(self):
+        os_info = {}
+        if os.path.isfile("/etc/os-release"):
+            with open("/etc/os-release") as f:
+                for line in f:
+                    key, value = line.strip().split("=", 1)
+                    os_info[key] = value.strip('"')
+        # Prioritize ID_LIKE over ID
+        os_type = os_info.get('ID_LIKE', os_info.get('ID', None))
+        # Handle the case where ID_LIKE can contain multiple space-separated strings
+        if os_type and ' ' in os_type:
+            os_type = os_type.split(' ')[0]  # Get the first 'like' identifier
+        return os_type
+
+    def install_os_packages(self, pkg_list, package_skip_set=[]):
+        # pkg_list can be a simple list of strings or a list of tuples 
+        # if a package has a different name on different OSes
+        os_type = self._get_os_type()
+        # Determine the appropriate package manager for the detected OS type
+        package_manager = None
+        if os_type in ['debian', 'ubuntu']:
+            package_manager = 'apt'
+        elif os_type in ['fedora', 'centos', 'redhat', 'rhel']:
+            package_manager = 'dnf'        
+        if not package_manager:
+            print("Unsupported operating system.")
+            return        
+        for package_tuple in pkg_list:
+            if isinstance(package_tuple, str):
+                package_tuple = (package_tuple,)
+            installed = False
+            for package_name in package_tuple:
+                # Check if the package has a known OS-specific suffix
+                if package_name in package_skip_set:
+                    print(f"Skipping {package_name} because it was already installed.")
+                    continue
+                if (package_name.endswith('-dev') and os_type in ['debian', 'ubuntu']) or \
+                (package_name.endswith('-devel') and os_type in ['fedora', 'centos', 'redhat']):
+                    try:
+                        print(f"Installing {package_name} with {package_manager}")                    
+                        subprocess.run(['sudo', package_manager, 'install', '-y', package_name], check=True)
+                        installed = True
+                        break
+                    except subprocess.CalledProcessError:
+                        pass            
+            # If none of the packages in the tuple had a suffix, we try to install each until one succeeds
+            if not installed:
+                for package_name in package_tuple:
+                    if package_name in package_skip_set:
+                        print(f"Skipping {package_name} because it was already installed.")
+                        continue                    
+                    try:
+                        print(f"Attempting to install {package_name} with {package_manager}")
+                        subprocess.run(['sudo', package_manager, 'install', '-y', package_name], check=True)
+                        print(f"Installed {package_name} successfully.")
+                        break  # Stop trying after the first successful install
+                    except subprocess.CalledProcessError:
+                        # If the package installation failed, it might be the wrong package for the OS,
+                        # so continue trying the next packages in the tuple
+                        pass
+
+
 
     def was_file_modified_in_last_24h(self, file_path):
         """
@@ -4019,7 +4321,7 @@ class ConfigManager:
         aws_dir = os.path.join(self.home_dir, ".aws")
 
         if not os.path.exists(aws_dir):
-            os.makedirs(aws_dir)
+            os.makedirs(aws_dir, exist_ok=True)
 
         if not os.path.isfile(self.awsconfigfile):
             if region:
@@ -4371,32 +4673,38 @@ def parse_arguments():
         'On x86-64 there are 2 vcpus per core and on Graviton (Arm) there is one core per vcpu')
     parser_launch.add_argument('--gpu-type', '-g', dest='gputype', action='store', default="", metavar='<gpu-type>',
         help='run --list to see available GPU types')       
-    parser_launch.add_argument('--mem', '-m', dest='mem', type=int, action='store', default=8, metavar='<memory-size>',
+    parser_launch.add_argument('--mem', '-m', dest='mem', type=int, action='store', default=8, metavar='<memory-size-gb>',
         help='GB Memory allocated to instance  (default=8)')
+    parser_launch.add_argument('--disk', '-d', dest='disk', type=int, action='store', default=300, metavar='<disk-size-gb>',
+        help='Add an EBS disk to the instance and mount it to /opt (default=300 GB')
     parser_launch.add_argument('--instance-type', '-t', dest='instancetype', action='store', default="", metavar='<aws.instance>',
         help='The EC2 instance type is auto-selected, but you can pick any other type here')    
     parser_launch.add_argument('--az', '-z', dest='az', action='store', default="",
         help='Enforce the availability zone, e.g. us-west-2a')    
-    parser_launch.add_argument('--on-demand', '-d', dest='ondemand', action='store_true', default=False,
+    parser_launch.add_argument('--on-demand', '-w', dest='ondemand', action='store_true', default=False,
         help="Enforce on-demand instance instead of using the default spot instance.")
+    parser_launch.add_argument('--keep-running', '-u', dest='keeprunning', action='store_true', default=False,
+        help="Do not shut down EC2 instance after builds are done, keep it running.")
     parser_launch.add_argument('--monitor', '-n', dest='monitor', action='store_true', default=False,
         help="Monitor EC2 server for cost and idle time.")
     parser_launch.add_argument('--build', '-b', dest='build', action='store_true', default=False,
         help="Execute the build on the current system instead of launching a new EC2 instance.")
     parser_launch.add_argument('--first-bucket', '-f', dest='firstbucket', action='store', default="", metavar='<your-s3-bucket>',
         help='use this bucket (e.g. easybuild-cache) to initially load the already built binaries and sources')       
-    parser_launch.add_argument('--skip-sources', '-s', dest='skipsources', action='store_true', default=False,
-        help="Do not pre-download sources from build cache, let EB download them.")      
+    # parser_launch.add_argument('--skip-sources', '-s', dest='skipsources', action='store_true', default=False,
+    #     help="Do not pre-download sources from build cache, let EB download them.")      
     parser_launch.add_argument('--eb-release', '-e', dest='ebrelease', action='store_true', default=False,
         help="Use official Easybuild release instead of dev repos from Github.")  
     parser_launch.add_argument('--check-skipped', '-k', dest='checkskipped', action='store_true', default=False,
         help="Re-check all previously skipped software packages and build them if possible.")    
-    parser_launch.add_argument('--include', '-i', dest='include', action='store', default="",
+    parser_launch.add_argument('--include', '-i', dest='include', action='store', default="", metavar='<include-list>',
         help='limit builds to certain module classes, e.g "bio" or "bio,lib,tools"')     
-    parser_launch.add_argument('--exclude', '-x', dest='exclude', action='store', default="",
+    parser_launch.add_argument('--exclude', '-x', dest='exclude', action='store', default="", metavar='<exclude-list>',
         help='exclude certain module classes, e.g "lib" or "dev,lib", only works if --include is not set')
     parser_launch.add_argument('--force-sshkey', '-r', dest='forcesshkey', action='store_true', default=False,
         help='This option will overwrite the ssh key pair in AWS with a new one and download it.')    
+    parser_launch.add_argument('--untar', dest='untar', action='store', default='',  metavar='<untar_folder>',
+        help='the name of a folder that contains tarballs to be extracted in place.')       
     
     # ***
     parser_download = subparsers.add_parser('download', aliases=['dld'],
